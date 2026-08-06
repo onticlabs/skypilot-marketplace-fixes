@@ -11,11 +11,12 @@ Target: `skypilot==0.13.0`.
 
 ## What it fixes
 
-**The catalog is never refreshed.** `sky/catalog/shadeform_catalog.py` caches the offer
-table twice, and neither cache expires: `read_catalog` is called without
-`pull_frequency_hours` (so the CSV on disk is frozen at first download — every other cloud
-passes a value), and the parsed frame is held in a module-level `_df` for the life of the
-process. A long-running API server therefore plans against whatever was current when its
+**The catalog is never refreshed.** `common.read_catalog` returns a `LazyDataFrame` whose
+loader is cleared at the end of every request, so every cloud gets a per-request re-read for
+free — except Shadeform, which is the only catalog that *materialises* that lazy frame into a
+plain DataFrame and then pins it in a module-level `_df` for the life of the process.
+Compounding it, `read_catalog` is called without `pull_frequency_hours`, so the CSV on disk
+never re-downloads either. A long-running API server therefore plans against whatever was current when its
 disk was created. Ours still offers an H100 at \$1.90 in a region where that instance type
 no longer exists; the optimizer picks it on every launch because it is the cheapest, and it
 can never be provisioned.

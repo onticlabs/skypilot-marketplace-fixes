@@ -1,56 +1,70 @@
 # skypilot-marketplace-fixes — implementation plan
 
-A SkyPilot API-server plugin carrying two anchored patches for upstream defects that make
-a **marketplace cloud** (one "cloud" fronting many independent providers) unusable when
+A SkyPilot API-server plugin carrying two anchored patches for upstream defects that make a
+**marketplace cloud** (one "cloud" fronting many independent providers) unusable when
 capacity is scarce. Nothing in it is Lyceum-specific, which is why it is not in
 `skypilot-lyceum`.
 
-Target: `skypilot==0.13.0`, the version pinned by `ontic-cli` and running on
+Target: `skypilot==0.13.*`, the version pinned by `ontic-cli` and running on
 `https://skypilot.onticlabs.io`.
+
+> **Revision 2.** Reviewed before implementation. The review corrected two factual claims,
+> replaced the Patch A mechanism, replaced the Patch B scoping, and removed the install-time
+> behavioural anchors — which could not have run. Measurements are from that review.
 
 ---
 
-## 1. The two defects, with measured evidence
+## 1. The two defects
 
-### Defect A — the Shadeform catalog is never refreshed, twice over
+### Defect A — the Shadeform catalog is frozen for the life of the process
 
-`sky/catalog/shadeform_catalog.py`:
+The mechanism is **not** simply a missing parameter. `common.read_catalog` returns a
+`LazyDataFrame` whose `_load_df` is an `@annotations.lru_cache(scope='request')`, and the
+executor clears that cache at the end of every request
+(`sky/server/requests/executor.py:822`). Every other cloud therefore gets a per-request
+re-read for free.
+
+`sky/catalog/shadeform_catalog.py:21-47` is the only catalog that **materialises** that lazy
+frame into a plain DataFrame:
 
 ```python
-_df = None                                             # module-level, process-lifetime
+_df = None
 
 def _get_df():
     global _df
     if _df is None:
-        df = common.read_catalog('shadeform/vms.csv')   # no pull_frequency_hours
-        ...
-        _df = df
+        df = common.read_catalog('shadeform/vms.csv')   # LazyDataFrame
+        df = df[df['InstanceType'].notna()]             # __getitem__ -> real DataFrame
+        _df = df.reset_index(drop=True)                 # frozen for the process
     return _df
 ```
 
-Two independent caches, both unbounded:
+Materialising defeats the request-scoped refresh, and the module-level `_df` then pins the
+result for the process lifetime. Compounding it, `read_catalog` is called without
+`pull_frequency_hours`, so `_need_update()` (`sky/catalog/common.py:217-228`) returns
+`False` whenever the file merely exists — the CSV on disk never re-downloads either.
 
-1. **On disk.** `common.read_catalog`'s `_need_update()` returns `False` whenever the file
-   exists and `pull_frequency_hours is None`. Every other cloud passes a value
-   (`_PULL_FREQUENCY_HOURS = 7`, i.e. 7 hours — aws, azure, gcp, cudo); Shadeform passes
-   nothing, so the CSV is frozen at first download forever.
-2. **In the process.** `_df` is populated once and never invalidated, so even a fresh file
-   on disk is ignored for the life of the server process.
+**Correction to revision 1:** it is false that "every other cloud passes a value". Twelve
+catalogs omit `pull_frequency_hours` — `fluidstack`, `hyperbolic`, `do`, `ibm`, `oci`,
+`primeintellect`, `scp`, `paperspace`, `yotta`, `vast`, `shadeform`, and `nebius` (which
+defines `_PULL_FREQUENCY_HOURS = 7` and then forgets to pass it). `seeweb` uses 8, not 7.
+Those others are largely rescued by the per-request cache clear; Shadeform is not, because
+of the materialisation above.
 
-Fixing either alone is a no-op. Fixing (1) only helps after a restart; fixing (2) only
-re-reads the same stale file.
+**Measured.** Our API server offers 9 `H100:1` Shadeform offers including
+`hyperstack_H100 @ montreal-canada-2 @ $1.90`. That instance type is absent from the last two
+upstream publications. It is the cheapest, so the optimizer picks it on every launch and it
+can never be provisioned — the direct cause of onticlabs/cli#18 (8 consecutive launches, all
+failing on `montreal-canada-2`, byte-identical).
 
-**Measured.** Our API server currently offers 9 `H100:1` Shadeform offers including
-`hyperstack_H100 @ montreal-canada-2 @ $1.90`. That instance type is absent from the last
-two upstream catalog publications. It is the cheapest, so the optimizer picks it on every
-launch — and it cannot be provisioned. This is the direct cause of onticlabs/cli#18
-(8 consecutive launches, all failing on `montreal-canada-2`, byte-identical).
+Upstream cadence is healthy: a bot republishes
+`skypilot-org/skypilot-catalog/catalogs/v8/shadeform/vms.csv` at 03:47, 10:05, 16:14 and
+22:33 UTC daily. The failure is entirely that we never pull it.
 
-Upstream publication cadence is healthy — a bot updates
-`skypilot-org/skypilot-catalog/catalogs/v8/shadeform/vms.csv` roughly every 6 hours
-(observed: 03:45, 10:05, 16:14, 22:33 UTC). The failure is entirely that we never pull it.
+**Bonus defect fixed for free:** a transient download failure at first read poisons `_df`
+with an empty DataFrame for the life of the process (`shadeform_catalog.py:33-39`).
 
-### Defect B — only the cheapest instance type per cloud is ever launchable
+### Defect B — only the cheapest instance type per cloud is launchable
 
 `sky/optimizer.py:1727-1739`:
 
@@ -62,253 +76,257 @@ if feasible_resources.resources_list:
     cloud_candidates[cloud].extend(feasible_resources.resources_list)
 ```
 
-Everything after `[0]` is discarded for provisioning purposes; `cloud_candidates` feeds
-only the "Considered resources" display table. `blocked_resources` is applied *after* this
-(line 1789), and never reaches `get_feasible_launchable_resources`, so the failover can
-only walk the regions of that one instance type and then reports the cloud exhausted.
+`blocked_resources` is applied afterwards (line 1789) and never reaches
+`get_feasible_launchable_resources`, so failover can only walk the regions of that one
+instance type before reporting the cloud exhausted. Verified by driving the real
+`RetryingVmProvisioner.provision_with_retries`: 7 offers existed, 2 were attempted, both
+`scaleway_H100`.
 
-Verified by driving the real `RetryingVmProvisioner.provision_with_retries`: 7 real offers
-existed, 2 were attempted, all of them `scaleway_H100`.
+**Correction to revision 1:** `cloud_candidates` is *not* display-only. It also drives
+`Optimizer._find_common_infras` / `_select_best_infra` (`optimizer.py:1261-1370`) for
+JobGroup SAME_INFRA optimisation. This plan does not mutate it — and must not.
 
-Not marketplace-specific in principle (AWS `T4:1` has 5 feasible instance types and only
-`g4dn.xlarge` becomes launchable) but harmless on hyperscalers, where an accelerator spec
-usually maps to one instance type per cloud.
+**Correction to revision 1:** "harmless on hyperscalers" is false. AWS `T4:1` has 5 feasible
+instance types, and folding them in costs 3–6× optimizer wall time (§3). Harmless in
+*semantics*, expensive in *cost*.
 
-**Why A alone is insufficient.** A catalog records *listings*, not live availability;
-nothing in SkyPilot queries a provider at plan or provision time. Comparing two
-consecutive upstream publications 6 hours apart: **2 of 9 `H100:1` offers vanished**
-(~20% churn per window). The cheapest offer is also the most contended. So a listing that
-is real when published and gone when provisioned is routine, and without B that is a total
-launch failure with no second attempt.
+**Confirmed, and worth stating:** failover blocking is per-(cloud, instance_type, region) —
+`_default_handler` blocks `launchable_resources.copy(zone=…)` and
+`Resources.should_be_blocked_by` (`resources.py:2108`) compares `instance_type` and `region`.
+Extra instance types genuinely survive the blocklist, so Patch B delivers real failover and
+not merely a longer list.
+
+**Also checked, benign:** `sky/clouds/shadeform.py:245` has a second `resources_list[0]`,
+inside `make_deploy_resources_variables`. The incoming resources already have `instance_type`
+set, so the feasible list has one element. Recorded because it looks exactly like the defect
+being fixed.
+
+**Why A alone is insufficient.** A catalog records listings, not live availability; nothing
+in SkyPilot queries a provider at plan or provision time. Between two consecutive upstream
+publications 6 hours apart, **2 of 9 `H100:1` offers vanished** (~20% churn per window), and
+the cheapest offer is the most contended. A listing that is real when published and gone when
+provisioned is routine; without B that is a total launch failure with no second attempt.
 
 ---
 
 ## 2. Scope
 
-**In scope:** the two patches above, packaged as a SkyPilot API-server plugin.
+**In scope:** the two patches, packaged as a SkyPilot API-server plugin.
 
-**Out of scope:** anything Lyceum-related (`skypilot-lyceum` keeps its three patches);
-client-side changes (`ontic-cli` PR #19 is decided separately, see §8); provisioning
-behaviour, credentials, and the Shadeform provisioner itself.
+**Out of scope:** anything Lyceum-specific; client-side changes (`ontic-cli` PR #19, see §7);
+provisioning behaviour, credentials, the Shadeform provisioner.
 
-**Non-goals:** live availability. This plugin cannot deliver it — there is no live query
-path in SkyPilot — and must not pretend to. It narrows a weeks-old snapshot to a
-~1-7 hour-old one, and makes a wrong listing survivable.
+**Non-goal:** live availability. There is no live query path in SkyPilot and this plugin must
+not pretend otherwise. It narrows a weeks-old snapshot to a ~1-hour-old one and makes a wrong
+listing survivable.
 
 ---
 
-## 3. Package shape
+## 3. The patches
+
+### Package shape
 
 ```
-skypilot-marketplace-fixes/
-  pyproject.toml                  # name: skypilot-marketplace-fixes
-  README.md                       # what, why, how to deploy, how to remove
-  src/skypilot_marketplace_fixes/
-    __init__.py                   # __version__, apply()
-    patches.py                    # PatchDriftError, the two patches, anchors
-    plugin.py                     # MarketplaceFixesPlugin(BasePlugin)
-  tests/
-    test_patches.py               # anchors, idempotency, behaviour
-    test_plugin.py                # contexts, install()
+src/skypilot_marketplace_fixes/
+  __init__.py                # __version__, apply(), kill switch
+  anchors.py                 # PatchDriftError + static anchor checks
+  catalog_freshness.py       # Patch A
+  launchable_offers.py       # Patch B
+  plugin.py                  # MarketplaceFixesPlugin(BasePlugin)
 ```
 
-Conventions copied deliberately from `skypilot-lyceum`: a module-level `apply()`, anchored
-patches, `PatchDriftError`, idempotency markers, and **no try/except around install** so a
-drift failure stops the server rather than producing one that boots clean and misbehaves.
-
-### Plugin registration
-
-`sky/server/plugins.py` loads `~/.sky/plugins.yaml`:
+Conventions from `skypilot-lyceum`: module-level `apply()`, anchored patches,
+`PatchDriftError`, idempotency markers, `_original` kept reachable, and **no try/except
+around install** so drift stops the server rather than producing one that boots clean and
+misbehaves.
 
 ```yaml
+# ~/.sky/plugins.yaml
 plugins:
   - class: skypilot_marketplace_fixes.plugin.MarketplaceFixesPlugin
+    parameters:
+      catalog_refresh_hours: 1
+      catalog_files: ["shadeform/vms.csv"]
+      failover_clouds: ["shadeform", "lyceum"]
+      max_extra_instance_types: 4
 ```
 
-Load contexts — both patches affect planning, which happens in more than one process:
+Every tunable is a plugin parameter, not a constant — including the cloud allowlist, so the
+package stays generic and the defaults carry the policy. Load contexts: `MAIN`, `UVICORN`,
+`EXECUTOR`, `CONTROLLER` — planning happens in all four.
 
-| context | needed | why |
-|---|---|---|
-| `MAIN` | yes | patch before main-process bootstrap touches the registry/catalog |
-| `EXECUTOR` | yes | where `optimize` and provisioning actually run |
-| `UVICORN` | yes | `POST /optimize` and `/validate` plan in the web process |
-| `CONTROLLER` | yes | managed jobs plan on the controller |
+### Patch A — catalog freshness
 
-Same set as the Lyceum plugin. Cheap to load; both patches are pure monkeypatching with no
-credentials and no network at import.
+**A1 — give `read_catalog` a pull frequency.** Wrap `sky.catalog.common.read_catalog`; when
+`filename` is in `catalog_files` and the caller passed `pull_frequency_hours=None`,
+substitute `catalog_refresh_hours`. Safe to widen later to the other eleven omitting catalogs
+(they hold `LazyDataFrame`s and are already rescued per request); **not** to be widened
+together with A2 — see the leak note.
+
+**A2 — stop materialising.** Replace `_get_df` so a single module-level `LazyDataFrame` is
+created **once** at patch time and the filtered frame is re-derived from it per call, cached
+behind a TTL. On expiry call `common.LazyDataFrame._load_df.cache_clear()` — do **not**
+construct a new `LazyDataFrame`. `_load_df` is a class-level `lru_cache(maxsize=128)` keyed
+on `self`, so minting one per expiry retains a `(LazyDataFrame, DataFrame)` pair each time:
+harmless for a 17 KB CSV, a real leak if this ever touched `aws/vms.csv` (5 MB).
+
+Measured re-filter cost: **0.22 ms/call**; `_get_df` is called 8× per `optimize` — 1.8 ms.
+
+**A3 — refresh off the hot path.** `_update_catalog` calls `requests.get` with **no timeout**
+and takes a `filelock.FileLock` with no timeout. Today that risk is paid once per process;
+hourly expiry would move it onto the optimizer path in every process. Given the 2026-07-30
+outage on this VM (53 s import vs uvicorn's 5 s worker ping), that is the wrong direction. So
+a daemon thread started in `install()` refreshes on a timer, and the inline TTL is generous
+(6 h) so the request path almost never downloads.
+
+`_need_update` is mtime-based and `_update_catalog` calls `os.utime(path, None)` on a failed
+fetch — a failed fetch costs a full interval. Multi-process is fine: each process expires
+independently, and `_update_catalog` re-checks under the filelock so only one downloads.
+
+### Patch B — make every feasible offer launchable
+
+Wrap `sky.optimizer._fill_in_launchable_resources`, which returns
+`(launchable, cloud_candidates, all_fuzzy_candidates, resource_hints)`.
+
+**Do not reuse `cloud_candidates`.** It is aggregated per cloud across *all* requested
+`Resources`, and folding that union into every requested entry measured badly:
+
+```
+                     launchables      Optimizer.optimize
+shadeform H100:1      2 →   7        0.264s → 0.266s   ×1.0
+aws T4:1             19 →  95        0.441s → 1.407s   ×3.2
+aws T4:1 spot        56 → 280        0.879s → 3.857s   ×4.4
+any_of x3 aws        31 → 321        0.589s → 3.369s   ×5.7
+```
+
+and it breaks an invariant: a requested `V100:1` entry with **no** feasible AWS resources
+(upstream logs `No resource satisfying …` and returns `[]`) acquired 107 launchables, leaving
+the log and the data disagreeing.
+
+**Instead, recompute the feasible set per requested `Resources`** inside the wrapper —
+`get_feasible_launchable_resources` costs ~2 ms warm. Exact by construction: no cross-entry
+leakage, no N× duplication, and `[]` stays `[]`.
+
+Bound the blast radius:
+- **Cloud allowlist** (`failover_clouds`, default `shadeform`, `lyceum`). Shadeform measured
+  ×1.0; the AWS/spot regressions disappear.
+- **Cap extra instance types per cloud** (`max_extra_instance_types`, default 4,
+  cheapest-first).
+- **Never fold into a requested entry the original returned `[]` for.**
+
+The optimizer still costs and sorts whatever it is given, so the cheapest is still chosen.
+Confirmed end-to-end: chosen resource and the "Considered resources" table are identical
+before and after, because `_get_resource_group_hash` groups by (cloud, accelerators,
+use_spot) and shows the min-cost member — already the folded-in `[0]`.
+
+Interactions checked and clean: the `ordered` path (`optimizer.py:1433-1455`) passes a
+single-resource task; `_optimize_by_dp`/`_optimize_by_ilp` see only the flat cost map;
+multi-node passes `num_nodes` through; job groups read `launchable_resources`.
+
+**Hazard to guard:** if `resources_utils.need_to_query_reservations()` is ever true,
+`get_available_reservations` (`optimizer.py:259-280`) fans a thread pool over
+`sum(launchable_resources.values(), [])` — N× the union, each a cloud API call. `False` here
+today; log a warning and skip folding if it becomes true.
+
+**Wrapper mechanics — each hit during review:**
+1. Parameter **names** are load-bearing: `optimizer.py:298` and `:1450` pass
+   `blocked_resources=` as a keyword. Anchor on names via `inspect.signature`, not arity.
+2. `Resources` defines neither `__eq__` nor `__hash__` — a `set()` dedupe silently does
+   nothing. Use a structural key `(str(cloud), instance_type, region, zone, use_spot,
+   str(accelerators))`.
+3. Materialise `blocked_resources` (typed `Optional[Iterable]`) to a list before re-filtering;
+   a consumed iterator blocks nothing, silently.
+4. Idempotency marker + `_original` reachable, per the Lyceum house style.
 
 ---
 
-## 4. Patch A — catalog freshness
+## 4. Anchors — static only
 
-Two coupled changes, both anchored.
+Revision 1 proposed a behavioural anchor ("refuse to install if upstream already returns >1
+instance type"). **Dropped: it cannot run.** `load_plugins(MAIN)` executes at
+`server/server.py:3548`, *before* `initialize_and_get_db()` at :3556, and
+`_fill_in_launchable_resources` calls `get_cached_enabled_clouds_or_refresh(...,
+raise_if_no_cloud_access=True)` on its first line. The same objection kills "probe
+`_get_df()`" — that is a network download during plugin install.
 
-### A1: give `read_catalog` a pull frequency for Shadeform
+Static anchors, in the shape `skypilot_lyceum/patches.py:168-179` already uses:
+- `inspect.signature(optimizer._fill_in_launchable_resources)` has parameters named `task`,
+  `blocked_resources`, `quiet`.
+- `inspect.getsource(...)` still contains `resources_list[0]` — **the real drift check**: if
+  upstream fixes the bug the substring disappears and we fail loudly, executing nothing.
+- `read_catalog` signature has `filename`, `pull_frequency_hours`; `shadeform_catalog` has a
+  module-level `_df` and a zero-arg `_get_df`; `_filter_out_blocked_launchable_resources` and
+  `make_launchables_for_valid_region_zones` exist.
 
-Wrap `sky.catalog.common.read_catalog`. When `filename == 'shadeform/vms.csv'` and the
-caller passed `pull_frequency_hours=None`, substitute `_PULL_FREQUENCY_HOURS` (default 1).
-
-Chosen narrowly rather than globally: other clouds already pass 7, and silently changing
-their cadence is out of scope.
-
-**Interval: 1 hour.** Upstream publishes every ~6h, so 1h means we are never more than one
-publication behind, at the cost of one small CSV GET per hour per process. `0` (refresh on
-every read) is rejected: `_get_df` is called inside optimizer loops.
-
-### A2: bound the in-process `_df` cache
-
-Wrap `sky.catalog.shadeform_catalog._get_df` so that when the cached frame is older than
-the TTL it sets `shadeform_catalog._df = None` before delegating, forcing both a re-read
-and (via A1) a re-download check.
-
-Uses `time.monotonic()`, so it cannot be confused by clock changes. Thread-safety: the
-worst case under a race is two threads both re-reading, which is wasteful but correct;
-`read_catalog` already takes a filelock for the download.
-
-### Anchors for A
-
-Refuse to install (raise `PatchDriftError`) unless all hold:
-
-- `sky.catalog.common.read_catalog` exists and its signature has parameters
-  `(filename, pull_frequency_hours)`.
-- `sky.catalog.shadeform_catalog._get_df` exists and is a zero-argument callable.
-- `sky.catalog.shadeform_catalog` has a module-level `_df` attribute.
-- A probe call to `_get_df()` returns a DataFrame with the expected columns
-  (`InstanceType`, `AcceleratorName`, `AcceleratorCount`, `Price`, `Region`).
-
-### Verification for A
-
-- Unit: with a temp `~/.sky` and a stubbed `read_catalog`, assert the substituted frequency
-  is 1 for `shadeform/vms.csv` and untouched for `aws/vms.csv`.
-- Unit: freeze/advance a fake clock; assert `_df` is invalidated exactly once per TTL and
-  that `_get_df()` still returns a frame.
-- Integration (offline, real files): populate the cache with the 3.5-week-old snapshot we
-  have archived, install the patch, advance the clock past the TTL, assert the frame now
-  contains the *fresh* offers and no longer contains `hyperstack_H100`.
+Plus a **runtime** no-op detector: if the original already returned >1 instance type for a
+cloud, log once at WARNING (`upstream appears fixed; delete this patch`) and skip folding for
+that cloud. Loud, never stops the server.
 
 ---
 
-## 5. Patch B — make every feasible offer launchable
+## 5. Deployment, rollback, observability
 
-### Approach: wrapper, not a rewrite
+**Deploy.** Build the wheel; install into the API server image beside `skypilot-lyceum`; add
+the `plugins.yaml` entry; deploy. Boot is the drift test.
 
-Wrap `sky.optimizer._fill_in_launchable_resources`. It returns
+**Controller gap — close it or scope it out explicitly.** Declaring
+`PluginContext.CONTROLLER` does nothing unless the wheel reaches the managed-jobs controller
+VM, which needs `controller_wheel_path` in `plugins.yaml` plus `~/.sky/remote_plugins.yaml`
+(`server/plugins.py:363-371, 426-454`). `provision_with_retries` — and the re-optimise Patch
+B exists to enable — runs **on the controller** for `sky jobs launch`. Without this, managed
+jobs stay unfixed and nobody notices.
 
-```python
-(launchable, cloud_candidates, all_fuzzy_candidates, resource_hints)
-```
+**Rollback.** Revision 1 assumed you can edit `plugins.yaml` and restart; on Fly, if
+`install()` raises you get a crash loop and the config lives in the image. So: an env-var
+kill switch read at the top of `install()` (`SKYPILOT_MARKETPLACE_FIXES_DISABLED=1`), making
+recovery `fly secrets set` rather than an image rebuild. This is the missing half of the
+"boot is the test" bet.
 
-and `cloud_candidates[cloud]` already contains **every** feasible resource — the same list
-`[0]` was taken from. So the wrapper does not need to reimplement the body; it folds the
-discarded candidates back into `launchable` and re-applies the blocklist:
+**Observability.** Today nobody would notice if Patch B stopped working — it degrades to
+exactly the current behaviour, and the current behaviour is 8 identical failed launches. So:
+- startup log per context: plugin version, anchors passed, active allowlist;
+- per-call debug: `folded +N launchables across M instance types for <cloud>`;
+- a **post-boot** health check (not an install-time anchor), once enabled clouds exist,
+  surfaced on `/api/plugins` or as a log line;
+- post-deploy verification of **both** patches:
+  `list_accelerators(name_filter="H100", clouds=["shadeform"])` must no longer return
+  `hyperstack_H100` (A), **and** a `sky.optimize` dryrun for `shadeform H100:1` must show ≥2
+  distinct instance types in the launchable set (B).
 
-```python
-for requested in list(launchable):
-    extra = [x for cloud, feasibles in cloud_candidates.items()
-               for r in feasibles
-               for x in resources_utils.make_launchables_for_valid_region_zones(r)]
-    merged = dedupe(launchable[requested] + extra)
-    launchable[requested] = optimizer._filter_out_blocked_launchable_resources(
-        merged, blocked_resources or [])
-```
+**Version pin.** `skypilot==0.13.*`: both patches are pinned to internals of one release, so
+`pip install -U skypilot` should fail the build, not the boot.
 
-Chosen over copying the ~90-line original because that body would have to be re-verified on
-every SkyPilot bump; the wrapper depends only on the return shape, which the anchors check.
-
-### Known imprecision, and the mitigation
-
-`cloud_candidates` is aggregated per cloud across **all** requested `Resources` of the task.
-For a task with several `any_of` entries that differ in something the candidate list does
-not capture, folding the union into every requested entry could make an entry launchable on
-hardware it did not ask for.
-
-Mitigation: only fold candidates into `launchable[requested]` when the task has exactly one
-requested `Resources`, OR when the candidate's `accelerators`/`use_spot`/`instance_type`
-are consistent with `requested`. **Decision needed** (see §9, Q1) — the reviewer should
-weigh "filter per requested entry" against "apply only for single-resource tasks".
-
-Note this interacts with `ontic-cli`: today it submits an `any_of` of N entries, which is
-exactly the multi-entry case. If PR #19's expansion is deleted (§8), tasks become
-single-resource and the imprecision disappears.
-
-### Ordering is preserved
-
-The optimizer still costs and sorts whatever it is given, so the cheapest offer is still
-chosen first. The patch only ensures the others remain reachable on failover.
-
-### Anchors for B
-
-- `sky.optimizer._fill_in_launchable_resources` exists and takes
-  `(task, blocked_resources, quiet)`.
-- It returns a 4-tuple whose 1st element is a dict and 2nd is a dict keyed by `Cloud`.
-- `sky.optimizer._filter_out_blocked_launchable_resources` exists and takes
-  `(resources_list, blocked_resources)`.
-- `sky.utils.resources_utils.make_launchables_for_valid_region_zones` exists.
-- **Behavioural anchor:** on a synthetic task with a stub cloud offering 2 instance types,
-  the *unpatched* function returns launchables for exactly one of them. If it already
-  returns both, upstream has fixed defect B and the patch refuses to install with a message
-  saying so — we must not silently keep a patch whose premise is gone.
-
-### Verification for B
-
-- Unit with a stub cloud: unpatched → 1 instance type launchable; patched → all of them.
-- Unit: blocked resources are still excluded after folding.
-- Unit: idempotent under repeated `apply()`.
-- Integration against the real Shadeform catalog (offline, cached CSV): patched
-  `_fill_in_launchable_resources` for `H100:1` yields ≥4 distinct instance types.
-- Integration through the real failover loop, with `_retry_zones` stubbed to fail: assert
-  every distinct instance type is attempted, not just the cheapest.
+**Security, acknowledged.** Catalogs are fetched over HTTPS from GitHub with an md5 written of
+whatever was downloaded — not a trusted digest. Raising pull frequency slightly widens the
+window in which a poisoned catalog could steer jobs. Low risk; recorded rather than claimed
+absent.
 
 ---
 
-## 6. Deployment
+## 6. Tests
 
-1. Build the wheel; install into the API server image alongside `skypilot-lyceum`.
-2. Add the entry to the server's `~/.sky/plugins.yaml`.
-3. Deploy. **Boot is the test**: a drift failure raises out of `install()` and the server
-   refuses to start, by design.
-4. Post-deploy check: `GET /api/plugins` lists `marketplace-fixes` with its version; then
-   `list_accelerators(name_filter="H100", clouds=["shadeform"])` must no longer return
-   `hyperstack_H100`, confirming Patch A took effect.
+Per-patch units, plus: no-op when upstream is fixed; keyword-argument compatibility with all
+three call sites; the `ordered` (resources-as-list) path; multi-node; the disabled-cloud /
+empty-feasible invariant; and that a transient catalog download failure no longer poisons
+`_df` for the process lifetime.
 
-## 7. Rollback
+## 7. Relationship to ontic-cli PR #19
 
-Remove the plugins.yaml entry and restart. No state is written, nothing is persisted, both
-patches are pure in-process monkeypatches. Uninstalling the wheel is optional.
+Once both patches are verified on the server, the client-side candidate expansion in PR #19 is
+redundant and should be **deleted**, leaving the parts that stand alone: the `sky.yaml`
+contract, the error-message work, `--retry-until-up`, and the stdout/`--json` hygiene.
 
-## 8. Relationship to ontic-cli PR #19
+Sequencing: land here, confirm on the server, then strip PR #19. Not both permanently. Patch
+B is designed to be correct for multi-entry `any_of` on its own merits, so it does **not**
+depend on PR #19 being stripped first.
 
-If both patches land and are verified, the client-side candidate expansion in PR #19 is
-redundant and should be **deleted**, leaving the parts that stand on their own: the
-`sky.yaml` contract (`infra` + hardware; `region`/`zone`/`instance_type`/`cloud`/`any_of`
-refused), the error-message work, `--retry-until-up`, and the stdout/`--json` hygiene.
+## 8. Upstream
 
-Sequencing: land these patches first, confirm on the server, then strip PR #19. Do not run
-both mechanisms permanently — two systems doing one job, and the client one carries all the
-catalog-drift risk for no added coverage.
-
-## 9. Open questions for review
-
-1. **Patch B scoping** (§5): filter folded candidates per requested `Resources`, or apply
-   the fold only to single-resource tasks? Which is safer given PR #19 currently submits
-   multi-entry `any_of`?
-2. **Patch A interval**: 1 hour against a 6-hour upstream cadence — reasonable, or should
-   it track the publication schedule more cleverly?
-3. **Should Patch A generalise** beyond Shadeform to any cloud whose catalog passes
-   `pull_frequency_hours=None`? Today that is only Shadeform, but a future marketplace
-   plugin would hit the same trap.
-4. **Behavioural anchor for B** (§5): is "refuse to install if upstream already returns
-   >1 instance type" right, or too aggressive for a server that must boot?
-5. Anything in either patch that could deadlock, leak memory, or slow the optimizer
-   materially on a large cloud (AWS: 5 instance types × ~19 regions instead of 19).
-
-## 10. Upstream
-
-Both defects are worth filing regardless, each a small change with a measured
-justification:
-
-- `shadeform_catalog.py`: pass `pull_frequency_hours` like every other catalog (and
-  consider invalidating `_df`).
+Three one-liners worth filing, cheapest first:
+- `nebius_catalog.py` defines `_PULL_FREQUENCY_HOURS` and never passes it — the smallest,
+  most obviously-correct PR, and a good trust-builder.
+- `shadeform_catalog.py`: pass `pull_frequency_hours`, and stop materialising the
+  `LazyDataFrame` so the per-request cache clear works as it does for every other cloud.
 - `optimizer.py`: iterate `feasible_resources.resources_list` rather than taking `[0]`.
 
-If either is accepted and released, the corresponding patch here is deleted.
+If any lands in a release, delete the corresponding patch here rather than carrying it.
