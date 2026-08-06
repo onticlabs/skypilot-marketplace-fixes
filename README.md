@@ -40,6 +40,17 @@ publications, ~20% of `H100:1` offers disappeared within one window. This plugin
 weeks-old snapshot to a ~1-hour-old one and makes a wrong listing survivable — it does not
 make listings true.
 
+## What is not covered: managed jobs
+
+`sky jobs launch` runs its provisioning retries on the managed-jobs **controller VM**, not
+on the API server, so Patch B does not reach it. That is deliberate and explicit: the wheel
+only arrives on a controller via `controller_wheel_path` plus a `remote_plugins.yaml`, and
+this package ships neither. Declaring `PluginContext.CONTROLLER` without them would make the
+plugin look like it covers managed jobs while doing nothing — a worse outcome than an
+honest gap.
+
+`sky launch`, which is what `ontic launch` uses, is fully covered.
+
 ## Install
 
 Build and install the wheel into the API server image, then register it:
