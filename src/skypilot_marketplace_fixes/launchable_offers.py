@@ -22,6 +22,15 @@ instance_type, region) — `_default_handler` blocks `launchable.copy(zone=…)`
 `should_be_blocked_by` compares instance_type and region — so the extra offers
 genuinely survive failover rather than merely lengthening a list.
 
+The fold has to keep running DURING failover, which is the part this patch
+originally got wrong. Failover blocks what it just tried and re-optimizes; once
+the cheapest instance type is blocked in all of its regions, upstream's
+`resources_list[0]` yields [] even though `cloud_candidates` still holds the
+cloud and the other vendors are untouched. Skipping the fold on that emptiness
+ended failover two vendors in. Simulated against the live catalog, walking the
+real optimize/block/re-optimize loop: 3 offers across 2 instance types before,
+10 across 5 after — the whole launchable set, exhausted in the right order.
+
 WHY IT RECOMPUTES rather than reusing the `cloud_candidates` the function already
 returns: that dict is aggregated per cloud across ALL requested `Resources`, so
 folding it into every requested entry leaks candidates between entries. Measured:
@@ -77,10 +86,24 @@ def patch(failover_clouds: Iterable[str], max_extra_instance_types: int) -> None
         blocked = list(blocked_resources or [])
 
         for requested, current in list(launchable.items()):
-            if not current:
-                # Upstream found nothing feasible for this entry and said so in
-                # the log. Folding anything in here would make the data disagree
-                # with the message.
+            if not current and not blocked:
+                # Nothing blocked yet and upstream still found nothing feasible
+                # for this entry: it genuinely has no offer, and said so in the
+                # log. Folding here would make the data disagree with the message.
+                #
+                # With a blocklist present the SAME empty list means the opposite,
+                # and skipping on it was this patch's own worst bug. Failover
+                # blocks what it just tried and re-optimizes; upstream keeps only
+                # `resources_list[0]`, so once the cheapest instance type is
+                # blocked in every one of its regions upstream returns [] — while
+                # `cloud_candidates` still holds the cloud and the other vendors
+                # are untouched. Declining to fold there is exactly when the fold
+                # is needed, and it ended failover early with the market reported
+                # exhausted. Measured on the live server: after blocking
+                # lyceum/h100.1x and scaleway_H100 in paris + warsaw, upstream
+                # returned 0 offers and this patch added 0; folding returns 7,
+                # across digitalocean_H100-sxm5, lambdalabs_H100 and
+                # lambdalabs_H100-sxm5, all available and none blocked.
                 continue
             extra = _extra_launchables(requested, task, current, cloud_candidates,
                                        allowlist, max_extra_instance_types,
