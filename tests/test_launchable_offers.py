@@ -139,6 +139,44 @@ def test_the_original_stays_reachable_for_the_drift_check(shadeform):
     anchors.require_source_contains(original, 'resources_list[0]', 'anchor')
 
 
+def test_the_fold_still_runs_once_failover_has_emptied_upstreams_list(shadeform):
+    """The case this patch existed for and did not cover.
+
+    Failover blocks what it just tried and re-optimizes. Upstream keeps only
+    `resources_list[0]`, so once the cheapest instance type is blocked in every
+    one of its regions upstream returns [] — and the fold used to skip on exactly
+    that emptiness, ending failover with the market reported exhausted while
+    other vendors sat available and unblocked.
+    """
+    from sky import clouds, optimizer
+
+    launchable_offers.patch(['shadeform'], max_extra_instance_types=99)
+    original = optimizer._fill_in_launchable_resources._marketplace_fixes_original
+
+    task = sky.Task(run='echo hi')
+    task.set_resources(sky.Resources.from_yaml_config(REQ))
+    from sky import check as sky_check
+    sky_check.get_cached_enabled_clouds_or_refresh = lambda **kw: [shadeform]
+    optimizer.sky_check.get_cached_enabled_clouds_or_refresh = lambda **kw: [shadeform]
+
+    # What upstream alone would offer: one instance type, its regions.
+    upstream = [r for lst in original(task, [], quiet=True)[0].values() for r in lst]
+    victim_types = {r.instance_type for r in upstream}
+    assert len(victim_types) == 1, 'upstream is expected to keep exactly one type'
+    victim = next(iter(victim_types))
+
+    # Exactly what failover accumulates: that type, blocked in every region.
+    blocked = [sky.Resources(cloud=clouds.Shadeform(), instance_type=r.instance_type,
+                             region=r.region) for r in upstream]
+
+    kept, _, _, _ = optimizer._fill_in_launchable_resources(task, blocked, quiet=True)
+    types = {r.instance_type for lst in kept.values() for r in lst}
+
+    assert victim not in types, 'the blocked type must stay blocked'
+    assert types, ('failover was left with no offers while other vendors were '
+                   'available — the whole market reads as exhausted')
+
+
 def test_an_entry_with_no_feasible_resources_stays_empty():
     # Upstream logs "No resource satisfying ..." and returns []. Folding anything
     # in would leave the log and the data disagreeing.
