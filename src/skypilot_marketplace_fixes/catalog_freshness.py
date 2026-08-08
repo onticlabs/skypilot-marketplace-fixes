@@ -35,6 +35,11 @@ worker's refresh cycle, phase-offset by process start) put the worst case at jus
 under twice the interval and let workers disagree in between; one `os.stat` puts
 every worker on the newest bytes the moment anyone writes them, whoever that is.
 `_STALE_AFTER_S` remains only as a backstop for a file that stops changing at all.
+
+Known gap, pre-existing and NOT covered here: if the `.meta/*.md5` sidecar is lost
+while the CSV survives, `is_catalog_modified` pins `_need_update` to False and
+downloads stop permanently and silently. Every worker then converges — faithfully —
+on a file that will never update again. See `_STALE_AFTER_S`.
 """
 from __future__ import annotations
 
@@ -56,11 +61,15 @@ _MATERIALISING_CATALOG = 'shadeform/vms.csv'
 
 #: Backstop only. Freshness is decided by the FILE's identity (`_file_key`), not by
 #: a clock: any change on disk is picked up on the next call, whoever wrote it. This
-#: timer exists for the one case identity cannot see — the file never changing
-#: because nothing is downloading it (a dead refresher, or the lost-md5 trap where
-#: `is_catalog_modified` pins `_need_update` to False). Re-deriving then re-runs the
-#: download check. One hour, matching the refresher, so a process that somehow lost
-#: its thread degrades to "as fresh as the file" rather than to hours of drift.
+#: timer exists for the one case identity cannot see — a file that stops changing
+#: because nothing is downloading it — and re-deriving is what re-runs the download
+#: check. One hour, matching the refresher, so a process that somehow lost its
+#: thread degrades to "as fresh as the file" rather than to hours of drift.
+#:
+#: It does NOT rescue a lost `.meta/*.md5` sidecar: `is_catalog_modified` then
+#: returns True, which pins `_need_update` to False, and re-running a check that
+#: permanently declines just re-reads the same bytes. That trap (crash between
+#: `os.rename` and the md5 write, or a restored volume) needs its own detection.
 _STALE_AFTER_S = 3600
 
 #: `key` is the (mtime_ns, size) of the CSV the frame was derived from.
@@ -269,9 +278,33 @@ def _evict(lazy) -> None:
     lazy._df = None
 
 
+def _snapshot(lazy):
+    """ONE read of the lazy frame, so a concurrent `_evict` cannot split it.
+
+    Reads happen off `_lock` (see `refresh`), so a refresher thread can call `_evict`
+    while a request thread is inside `_load_df`. Two hazards, both closed here by
+    taking a single local reference:
+
+    * upstream sets `self._df` and then returns it (two statements); an `_evict`
+      landing between them returns None to us. Re-reading once is enough — the
+      window is a few instructions and the retry re-populates it.
+    * indexing the lazy TWICE (`lazy[lazy[...]]`) could build a mask from one
+      version of the file and apply it to another. Equal row counts would not even
+      raise; it would cache a silently wrong catalog under a valid key, which is
+      precisely the class of fault this module exists to prevent.
+    """
+    df = lazy._load_df()
+    if df is None:
+        df = lazy._load_df()
+    if df is None:
+        raise RuntimeError('the catalog frame was evicted twice mid-read')
+    return df
+
+
 def _filtered(lazy):
     """Upstream's own filtering, applied to the lazy frame rather than replacing it."""
-    df = lazy[lazy['InstanceType'].notna()]
+    df = _snapshot(lazy)
+    df = df[df['InstanceType'].notna()]
     if 'AcceleratorName' in df.columns:
         df = df[df['AcceleratorName'].notna()]
         df = df.assign(

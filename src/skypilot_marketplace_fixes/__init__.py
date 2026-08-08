@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import os
 
-__version__ = '0.4.0.dev0'
+__version__ = '0.4.1.dev0'
 
 logger = logging.getLogger(__name__)
 

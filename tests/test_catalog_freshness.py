@@ -86,8 +86,14 @@ def test_the_frame_is_re_derived_when_the_file_changes(monkeypatch, tmp_path):
     # a TTL and without having done the download itself.
     from sky.catalog import common as catalog_common
 
+    before = 'InstanceType,AcceleratorName,Price\nphantom_H100,H100,2.73\n'
+    after = 'InstanceType,AcceleratorName,Price\nreal_H100,H100,3.30\n'
+    # The key is (mtime_ns, size). Same-length payloads written inside one mtime
+    # granule would collide, so this test must not depend on timing alone.
+    assert len(before) != len(after), 'keep the two payloads different lengths'
+
     csv = tmp_path / 'vms.csv'
-    csv.write_text('InstanceType,AcceleratorName,Price\nphantom_H100,H100,2.73\n')
+    csv.write_text(before)
     catalog_freshness._state.update({
         'lazy': catalog_common.LazyDataFrame(str(csv),
                                              update_if_stale_func=lambda: False),
@@ -103,10 +109,36 @@ def test_the_frame_is_re_derived_when_the_file_changes(monkeypatch, tmp_path):
     catalog_freshness._frame(catalog_common)
     assert catalog_freshness._state['key'] == key
 
-    csv.write_text('InstanceType,AcceleratorName,Price\nreal_H100,H100,3.30\n')
+    csv.write_text(after)
     assert list(catalog_freshness._frame(catalog_common)['InstanceType']) == \
         ['real_H100']
     assert catalog_freshness._state['key'] != key
+
+
+def test_an_evict_landing_mid_read_does_not_surface_a_null_frame(monkeypatch, tmp_path):
+    # Reads run off `_lock`, so the refresher can evict while a request thread is
+    # inside `_load_df` — upstream assigns `self._df` and returns it as two separate
+    # statements. Serving None there would raise out of `_filtered` and drop
+    # Shadeform from that plan entirely.
+    from sky.catalog import common as catalog_common
+
+    csv = tmp_path / 'vms.csv'
+    csv.write_text('InstanceType,AcceleratorName,Price\nscaleway_H100,H100,3.30\n')
+    lazy = catalog_common.LazyDataFrame(str(csv), update_if_stale_func=lambda: False)
+    _point_catalog_at(monkeypatch, catalog_common, csv)
+
+    real_load = lazy._load_df
+    calls = []
+
+    def _evicted_once():
+        calls.append(1)
+        if len(calls) == 1:
+            return None      # exactly what a concurrent _evict produces
+        return real_load()
+
+    monkeypatch.setattr(lazy, '_load_df', _evicted_once)
+    assert list(catalog_freshness._filtered(lazy)['InstanceType']) == ['scaleway_H100']
+    assert len(calls) == 2, 'the retry after an evicted read must happen'
 
 
 def test_a_file_that_stops_changing_is_still_re_read_eventually(monkeypatch, tmp_path):
