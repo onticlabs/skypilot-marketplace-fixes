@@ -19,7 +19,8 @@ def _unpatch():
     yield
     catalog_common.read_catalog = getattr(read, '_marketplace_fixes_original', read)
     shadeform_catalog._get_df = getattr(get_df, '_marketplace_fixes_original', get_df)
-    catalog_freshness._state.update({'lazy': None, 'frame': None, 'loaded_at': 0.0})
+    catalog_freshness._state.update({'lazy': None, 'frame': None, 'key': None,
+                                     'loaded_at': 0.0})
 
 
 # --- A1: the on-disk catalog gains a TTL --------------------------------------------
@@ -74,18 +75,90 @@ def test_the_module_global_is_released_and_get_df_still_works():
     assert len(frame) > 0
 
 
-def test_the_frame_is_re_derived_once_the_ttl_passes(monkeypatch):
-    from sky.catalog import shadeform_catalog
+def _point_catalog_at(monkeypatch, catalog_common, csv):
+    """`_file_key` stats whatever `get_catalog_path` resolves to."""
+    monkeypatch.setattr(catalog_common, 'get_catalog_path', lambda filename: str(csv))
 
-    catalog_freshness.patch(('shadeform/vms.csv',), refresh_hours=1)
-    shadeform_catalog._get_df()
-    first_loaded = catalog_freshness._state['loaded_at']
 
-    # Past the inline TTL. Deliberately not sleeping: this is a 6-hour window.
+def test_the_frame_is_re_derived_when_the_file_changes(monkeypatch, tmp_path):
+    # The property that matters: freshness follows the FILE, not a clock, so a
+    # worker converges on whatever another worker just wrote without waiting out
+    # a TTL and without having done the download itself.
+    from sky.catalog import common as catalog_common
+
+    csv = tmp_path / 'vms.csv'
+    csv.write_text('InstanceType,AcceleratorName,Price\nphantom_H100,H100,2.73\n')
+    catalog_freshness._state.update({
+        'lazy': catalog_common.LazyDataFrame(str(csv),
+                                             update_if_stale_func=lambda: False),
+        'frame': None, 'key': None, 'loaded_at': 0.0})
+    _point_catalog_at(monkeypatch, catalog_common, csv)
+
+    assert list(catalog_freshness._frame(catalog_common)['InstanceType']) == \
+        ['phantom_H100']
+    key = catalog_freshness._state['key']
+    assert key is not None, 'the frame must record the identity it came from'
+
+    # No change on disk: served from memory, identity unchanged.
+    catalog_freshness._frame(catalog_common)
+    assert catalog_freshness._state['key'] == key
+
+    csv.write_text('InstanceType,AcceleratorName,Price\nreal_H100,H100,3.30\n')
+    assert list(catalog_freshness._frame(catalog_common)['InstanceType']) == \
+        ['real_H100']
+    assert catalog_freshness._state['key'] != key
+
+
+def test_a_file_that_stops_changing_is_still_re_read_eventually(monkeypatch, tmp_path):
+    # Backstop for what identity cannot see: nothing is writing the file at all
+    # (dead refresher, or the lost-md5 trap that pins `_need_update` to False).
+    # Re-deriving is what re-runs the download check.
+    from sky.catalog import common as catalog_common
+
+    csv = tmp_path / 'vms.csv'
+    csv.write_text('InstanceType,AcceleratorName,Price\nphantom_H100,H100,2.73\n')
+    reads = []
+    catalog_freshness._state.update({
+        'lazy': catalog_common.LazyDataFrame(
+            str(csv), update_if_stale_func=lambda: reads.append(1) is None),
+        'frame': None, 'key': None, 'loaded_at': 0.0})
+    _point_catalog_at(monkeypatch, catalog_common, csv)
+
+    catalog_freshness._frame(catalog_common)
+    before = len(reads)
+    catalog_freshness._frame(catalog_common)
+    assert len(reads) == before, 'an unchanged file must not be re-read'
+
+    loaded = catalog_freshness._state['loaded_at']
     monkeypatch.setattr(time, 'monotonic',
-                        lambda: first_loaded + catalog_freshness._INLINE_TTL_S + 1)
-    shadeform_catalog._get_df()
-    assert catalog_freshness._state['loaded_at'] > first_loaded
+                        lambda: loaded + catalog_freshness._STALE_AFTER_S + 1)
+    catalog_freshness._frame(catalog_common)
+    assert len(reads) > before, 'the backstop must re-run the download check'
+
+
+def test_the_read_never_holds_the_state_lock(monkeypatch, tmp_path):
+    # The read can download, and upstream `_update_catalog` gives requests.get no
+    # timeout and its filelock no timeout. Holding `_lock` across it would turn one
+    # hung connection into a worker whose Shadeform planning never returns — a worse
+    # failure than the stale catalog this module exists to prevent.
+    from sky.catalog import common as catalog_common
+
+    csv = tmp_path / 'vms.csv'
+    csv.write_text('InstanceType,AcceleratorName,Price\nphantom_H100,H100,2.73\n')
+    catalog_freshness._state.update({
+        'lazy': catalog_common.LazyDataFrame(str(csv),
+                                             update_if_stale_func=lambda: False),
+        'frame': None, 'key': None, 'loaded_at': 0.0})
+    _point_catalog_at(monkeypatch, catalog_common, csv)
+
+    observed = []
+    real_filtered = catalog_freshness._filtered
+    monkeypatch.setattr(catalog_freshness, '_filtered',
+                        lambda lazy: (observed.append(catalog_freshness._lock.locked())
+                                      or real_filtered(lazy)))
+    catalog_freshness.refresh(force=True)
+
+    assert observed == [False], 'the download path ran while holding _lock'
 
 
 def test_one_lazy_frame_is_reused_across_refreshes():

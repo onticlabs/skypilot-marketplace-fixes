@@ -22,17 +22,24 @@ every time and it can never be provisioned.
 Four parts, all needed:
   A1  give `read_catalog` a pull frequency, so the file on disk can re-download.
   A2  stop materialising: hold ONE LazyDataFrame and re-derive the filtered frame
-      behind a TTL, clearing the shared loader cache on expiry.
-  A3  do the refreshing on a daemon thread, so the download never lands on the
-      optimizer's path.
+      whenever the CSV underneath it changes, clearing the shared loader cache.
+  A3  do the downloading on a daemon thread, so it is normally off the request path.
   A4  evict the LazyDataFrame's own `_df` on refresh. A1-A3 are not enough on a
       server with several long-lived executor workers: only the worker that wins
       the download race re-reads, and the rest serve a startup snapshot forever.
       See `_evict`.
+
+Freshness is keyed on the FILE's identity — `(mtime_ns, size)` — rather than on a
+per-process timer. Two independent clocks (the file's download cycle and each
+worker's refresh cycle, phase-offset by process start) put the worst case at just
+under twice the interval and let workers disagree in between; one `os.stat` puts
+every worker on the newest bytes the moment anyone writes them, whoever that is.
+`_STALE_AFTER_S` remains only as a backstop for a file that stops changing at all.
 """
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections.abc import Iterable
@@ -47,14 +54,21 @@ logger = logging.getLogger(__name__)
 #: holding a frame for a 5 MB catalog like `aws/vms.csv` is a different tradeoff.
 _MATERIALISING_CATALOG = 'shadeform/vms.csv'
 
-#: How stale the in-process frame may get before a CALLER re-derives it. Generous
-#: on purpose: the daemon thread (A3) does the real refreshing, and
-#: `_update_catalog` calls `requests.get` with no timeout and takes a filelock
-#: with no timeout — neither belongs on a request path. This is the backstop for
-#: when the thread is dead or was never started.
-_INLINE_TTL_S = 6 * 3600
+#: Backstop only. Freshness is decided by the FILE's identity (`_file_key`), not by
+#: a clock: any change on disk is picked up on the next call, whoever wrote it. This
+#: timer exists for the one case identity cannot see — the file never changing
+#: because nothing is downloading it (a dead refresher, or the lost-md5 trap where
+#: `is_catalog_modified` pins `_need_update` to False). Re-deriving then re-runs the
+#: download check. One hour, matching the refresher, so a process that somehow lost
+#: its thread degrades to "as fresh as the file" rather than to hours of drift.
+_STALE_AFTER_S = 3600
 
-_state: dict = {'lazy': None, 'frame': None, 'loaded_at': 0.0}
+#: `key` is the (mtime_ns, size) of the CSV the frame was derived from.
+_state: dict = {'lazy': None, 'frame': None, 'key': None, 'loaded_at': 0.0}
+
+#: Guards `_state` ONLY. Never held across a read: `_update_catalog` downloads with
+#: no timeout under a filelock with no timeout, and holding this lock across that
+#: turns one hung connection into a worker whose Shadeform planning never returns.
 _lock = threading.Lock()
 _refresher: threading.Thread | None = None
 
@@ -145,56 +159,89 @@ def _patch_get_df(catalog_common, shadeform_catalog) -> None:
     shadeform_catalog._df = None
 
 
+def _file_key(catalog_common):
+    """Identity of the CSV on disk: `(mtime_ns, size)`, or None if it is not there.
+
+    This, not a timer, is what decides whether the cached frame is current. It costs
+    one `os.stat` and it converges on ANY writer — this process, another worker, or a
+    hand-edited file — which a per-process clock cannot do.
+    """
+    try:
+        st = os.stat(catalog_common.get_catalog_path(_MATERIALISING_CATALOG))
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
 def _frame(catalog_common):
-    """The filtered offer table, re-derived when the TTL has passed."""
-    now = time.monotonic()
+    """The filtered offer table, re-derived when the file underneath it changed."""
+    key = _file_key(catalog_common)
     with _lock:
-        fresh_enough = (_state['frame'] is not None and
-                        now - _state['loaded_at'] < _INLINE_TTL_S)
-        if fresh_enough:
+        current = (_state['frame'] is not None and key is not None and
+                   _state['key'] == key and
+                   time.monotonic() - _state['loaded_at'] < _STALE_AFTER_S)
+        if current:
             return _state['frame']
     return refresh(force=False, catalog_common=catalog_common)
 
 
 def refresh(force: bool, catalog_common=None):
-    """Re-derive the filtered frame from the (single) LazyDataFrame."""
+    """Re-derive the filtered frame from the (single) LazyDataFrame.
+
+    The read happens OUTSIDE `_lock`. It can download, and `_update_catalog` gives
+    `requests.get` no timeout and its filelock no timeout, so holding the lock across
+    it would let one hung connection wedge every caller of `_get_df` in this process —
+    trading a stale catalog for a worker that cannot plan at all. Two threads racing
+    here cost a duplicate read of a 20 KB CSV and nothing else.
+    """
     if catalog_common is None:
         from sky.catalog import common as catalog_common
 
     with _lock:
-        now = time.monotonic()
-        if not force and _state['frame'] is not None and \
-                now - _state['loaded_at'] < _INLINE_TTL_S:
+        key = _file_key(catalog_common)
+        if not force and _state['frame'] is not None and key is not None and \
+                _state['key'] == key and \
+                time.monotonic() - _state['loaded_at'] < _STALE_AFTER_S:
             return _state['frame']
 
-        if _state['lazy'] is None:
-            # Built on FIRST USE, not at patch time: `read_catalog` downloads
-            # when the file is missing, and a plugin `install()` must not do
-            # network I/O — that is the boot-path stall this server has been
-            # taken down by before.
-            _state['lazy'] = catalog_common.read_catalog(_MATERIALISING_CATALOG)
+        lazy = _state['lazy']
+        if lazy is None:
+            # Built on FIRST USE, not at patch time: `read_catalog` resolves a path
+            # that may not exist yet, and a plugin `install()` must not do network
+            # I/O — that is the boot-path stall this server has been taken down by
+            # before. Constructing it does not read or download; `_load_df` does.
+            lazy = _state['lazy'] = catalog_common.read_catalog(_MATERIALISING_CATALOG)
+            fresh_instance = True
         else:
-            # Shared, class-level lru_cache keyed on the LazyDataFrame instance.
-            # Clearing it is what makes the SAME instance re-read; minting a new
-            # LazyDataFrame instead would retain a (frame, loader) pair per
-            # refresh for up to 128 entries.
-            catalog_common.LazyDataFrame._load_df.cache_clear()
-            _evict(_state['lazy'])
+            fresh_instance = False
 
-        try:
-            frame = _filtered(_state['lazy'])
-        except Exception as e:  # noqa: BLE001 - any read failure degrades, never raises
-            # Deliberately NOT cached. Upstream caches the empty fallback frame
-            # in `_df` forever, so one transient download failure at first read
-            # poisons the process for its lifetime.
-            logger.warning('marketplace-fixes: could not read %s (%s); serving '
-                           'an empty catalog for this call only',
-                           _MATERIALISING_CATALOG, e)
-            return _empty_frame()
+    if not fresh_instance:
+        # Shared, class-level lru_cache keyed on the LazyDataFrame instance. Clearing
+        # it is what makes the SAME instance re-read; minting a new LazyDataFrame
+        # instead would retain a (frame, loader) pair per refresh for up to 128
+        # entries. `_evict` is the half that actually matters — see its docstring.
+        catalog_common.LazyDataFrame._load_df.cache_clear()
+        _evict(lazy)
 
+    try:
+        frame = _filtered(lazy)
+    except Exception as e:  # noqa: BLE001 - any read failure degrades, never raises
+        # Deliberately NOT cached. Upstream caches the empty fallback frame in `_df`
+        # forever, so one transient download failure at first read poisons the
+        # process for its lifetime.
+        logger.warning('marketplace-fixes: could not read %s (%s); serving '
+                       'an empty catalog for this call only',
+                       _MATERIALISING_CATALOG, e)
+        return _empty_frame()
+
+    with _lock:
         _state['frame'] = frame
+        # Re-stat rather than reuse the key read above: the read may itself have
+        # downloaded a new file, and stamping the OLD key would leave the next caller
+        # believing this frame is older than it is, re-deriving it for nothing.
+        _state['key'] = _file_key(catalog_common)
         _state['loaded_at'] = time.monotonic()
-        return frame
+    return frame
 
 
 def _evict(lazy) -> None:
