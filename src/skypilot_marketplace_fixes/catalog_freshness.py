@@ -19,12 +19,16 @@ the machine's disk. Ours still offers an H100 at $1.90 in a region where that
 instance type no longer exists — the cheapest listing, so the optimizer picks it
 every time and it can never be provisioned.
 
-Three parts, all needed:
+Four parts, all needed:
   A1  give `read_catalog` a pull frequency, so the file on disk can re-download.
   A2  stop materialising: hold ONE LazyDataFrame and re-derive the filtered frame
       behind a TTL, clearing the shared loader cache on expiry.
   A3  do the refreshing on a daemon thread, so the download never lands on the
       optimizer's path.
+  A4  evict the LazyDataFrame's own `_df` on refresh. A1-A3 are not enough on a
+      server with several long-lived executor workers: only the worker that wins
+      the download race re-reads, and the rest serve a startup snapshot forever.
+      See `_evict`.
 """
 from __future__ import annotations
 
@@ -118,9 +122,16 @@ def _patch_get_df(catalog_common, shadeform_catalog) -> None:
             'sky.catalog.shadeform_catalog no longer has a module-level `_df`. '
             'The caching shape this patch replaces has changed; upstream may '
             'have fixed it, in which case DELETE this patch rather than keep it.')
-    anchors.require_attr(
+    lazy_cls = anchors.require_attr(
         catalog_common, 'LazyDataFrame',
         'Its shared loader cache is what gets cleared on expiry.')
+    # `_evict` drops `self._df` because `_load_df` short-circuits on it. If that
+    # short-circuit ever goes away, the eviction is dead weight and should go too.
+    anchors.require_source_contains(
+        lazy_cls._load_df, 'self._df is None',
+        'LazyDataFrame._load_df no longer re-reads based on `self._df`; the '
+        'per-process freeze this eviction works around may be fixed upstream. '
+        'Re-check `_evict` and delete it if so.')
 
     def patched():
         return _frame(catalog_common)
@@ -168,6 +179,7 @@ def refresh(force: bool, catalog_common=None):
             # LazyDataFrame instead would retain a (frame, loader) pair per
             # refresh for up to 128 entries.
             catalog_common.LazyDataFrame._load_df.cache_clear()
+            _evict(_state['lazy'])
 
         try:
             frame = _filtered(_state['lazy'])
@@ -183,6 +195,31 @@ def refresh(force: bool, catalog_common=None):
         _state['frame'] = frame
         _state['loaded_at'] = time.monotonic()
         return frame
+
+
+def _evict(lazy) -> None:
+    """Drop the LazyDataFrame's OWN copy of the frame, so it must re-read the CSV.
+
+    Clearing the lru_cache alone is not enough. `_load_df` re-reads only when::
+
+        if self._update_if_stale_func() or self._df is None:
+
+    and `_update_if_stale_func` reports whether THIS process performed the
+    download — not whether the file changed. The API server runs several
+    long-lived executor workers, each with its own LazyDataFrame over the same
+    path, so exactly one of them wins the download race and returns True. Every
+    other worker sees a file that is already fresh, keeps the `self._df` it read
+    at startup, and serves it for the lifetime of the process.
+
+    That is the same freeze this module exists to prevent, one level down, and
+    it is worse than the original: the workers disagree, so identical launches
+    succeed or fail depending on which one picks them up. Measured on the live
+    server (2026-08-08): two of three long workers were planning against a
+    20-hour-old snapshot whose cheapest H100, `massedcompute_H100` in
+    desmoines-usa-1, Shadeform had since withdrawn — so those launches failed
+    on a listing that no longer existed while real H100s sat available.
+    """
+    lazy._df = None
 
 
 def _filtered(lazy):

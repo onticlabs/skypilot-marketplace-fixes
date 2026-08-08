@@ -101,6 +101,42 @@ def test_one_lazy_frame_is_reused_across_refreshes():
     assert catalog_freshness._state['lazy'] is lazy
 
 
+def test_a_worker_that_did_not_win_the_download_race_still_re_reads(tmp_path):
+    # The API server runs several long-lived executor workers over one catalog file.
+    # Only the one that performs the download sees `update_if_stale_func() is True`;
+    # the others must still pick up what it wrote, or they plan against listings that
+    # were withdrawn hours ago while believing the file is fresh.
+    from sky.catalog import common as catalog_common
+
+    csv = tmp_path / 'vms.csv'
+    csv.write_text('InstanceType,AcceleratorName,Price\n'
+                   'massedcompute_H100,H100,2.73\n')
+    lazy = catalog_common.LazyDataFrame(str(csv), update_if_stale_func=lambda: False)
+    catalog_freshness._state.update({'lazy': lazy, 'frame': None, 'loaded_at': 0.0})
+    assert list(catalog_freshness.refresh(force=True)['InstanceType']) == \
+        ['massedcompute_H100']
+
+    # Another worker refreshes the file on disk; the cheap H100 is withdrawn.
+    csv.write_text('InstanceType,AcceleratorName,Price\n'
+                   'scaleway_H100,H100,3.30\n')
+
+    assert list(catalog_freshness.refresh(force=True)['InstanceType']) == \
+        ['scaleway_H100'], 'the loser of the download race is frozen on a phantom'
+
+
+def test_a_load_df_that_no_longer_short_circuits_refuses_to_patch(monkeypatch):
+    from sky.catalog import common as catalog_common
+    from sky.catalog import shadeform_catalog
+
+    class _AlwaysReReads:
+        def _load_df(self):
+            return 'no short circuit here'
+
+    monkeypatch.setattr(catalog_common, 'LazyDataFrame', _AlwaysReReads)
+    with pytest.raises(anchors.PatchDriftError, match='_evict'):
+        catalog_freshness._patch_get_df(catalog_common, shadeform_catalog)
+
+
 def test_a_download_failure_is_not_cached_for_the_process_lifetime(monkeypatch):
     # Upstream stores the empty fallback in `_df` forever, so one transient failure
     # at first read poisons the process. That is fixed here for free.
