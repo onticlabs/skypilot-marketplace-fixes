@@ -9,11 +9,18 @@ when capacity is scarce, or unaccountable after the fact:
      can reach one vendor and then reports the whole market exhausted;
   C  a zone filter against a catalog that has no zone column raises, and the
      pricing path swallows it as $0.00 — so a cluster nobody could price is
-     reported as one that was free.
+     reported as one that was free;
+  D  the guard meant to tolerate an instance type that has left the catalog
+     tests for "not found" while the message reads "No ... found", so a cluster
+     running on a delisted type takes down `sky status` for the whole
+     deployment and no new job can be submitted anywhere.
 
 A and B compound: a stale catalog puts a phantom offer at the top of the price
 list, and the truncation means nothing else is ever tried. C is independent, and
-silent — it made every successful Shadeform run report zero spend.
+silent — it made every successful Shadeform run report zero spend. D is the
+mirror image of C: not silent at all, but total, and A sets it off, because
+refreshing the catalog is exactly what makes a running cluster's instance type
+disappear.
 
 See `docs/PLAN.md` for the measurements and the design; `anchors.py` for how
 drift is detected.
@@ -23,7 +30,7 @@ from __future__ import annotations
 import logging
 import os
 
-__version__ = '0.5.0.dev0'
+__version__ = '0.6.0.dev0'
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +67,12 @@ def apply(parameters: dict | None = None, *, context: str = '') -> dict:
                        DISABLE_ENV)
         return {**config, 'enabled': False}
 
-    from skypilot_marketplace_fixes import catalog_freshness, launchable_offers, zoneless_pricing
+    from skypilot_marketplace_fixes import (
+        catalog_freshness,
+        launchable_offers,
+        vanished_instance_type,
+        zoneless_pricing,
+    )
 
     catalog_freshness.patch(config['catalog_files'],
                             config['catalog_refresh_hours'])
@@ -70,6 +82,12 @@ def apply(parameters: dict | None = None, *, context: str = '') -> dict:
     # property of the data, not a policy. A knob here could only be used to turn
     # correct pricing off.
     zoneless_pricing.patch()
+    # Applied BEFORE the background refresh starts: that refresh is what makes a
+    # running cluster's instance type vanish, so the window between "catalog
+    # replaced" and "guard installed" is the exact window this patch closes.
+    # No configuration either — "the instance type is not in the catalog" is a
+    # fact about the data, and a knob could only turn the outage back on.
+    vanished_instance_type.patch()
     catalog_freshness.start_background_refresh(config['catalog_refresh_hours'])
 
     logger.info(

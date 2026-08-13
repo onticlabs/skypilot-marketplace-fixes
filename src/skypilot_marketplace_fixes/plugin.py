@@ -9,8 +9,8 @@ import skypilot_marketplace_fixes
 
 
 class MarketplaceFixesPlugin(plugins.BasePlugin):
-    """Applies the catalog-freshness, multi-offer-failover and zoneless-pricing
-    patches."""
+    """Applies the catalog-freshness, multi-offer-failover, zoneless-pricing and
+    vanished-instance-type patches."""
 
     #: MANAGED JOBS ARE OUT OF SCOPE — `CONTROLLER` is deliberately absent.
     #:
