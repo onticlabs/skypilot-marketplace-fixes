@@ -1,8 +1,9 @@
 # skypilot-marketplace-fixes
 
-A SkyPilot API-server plugin carrying patches for two upstream defects that make a
+A SkyPilot API-server plugin carrying patches for four upstream defects that make a
 **marketplace cloud** — one "cloud" fronting many independent providers, like Shadeform —
-unusable when GPU capacity is scarce.
+unusable when GPU capacity is scarce, unaccountable after the fact, or fatally brittle when
+a listing disappears.
 
 Nothing here is provider-specific in intent; it lives outside `skypilot-lyceum` because it
 has nothing to do with Lyceum.
@@ -31,6 +32,27 @@ market.
 
 The two compound: a stale catalog puts a phantom offer at the top of the price list, and
 the truncation means nothing else is ever tried.
+
+**A zone filter against a catalog with no zones raises, and pricing swallows it as \$0.00.**
+`catalog.common._get_instance_type` filters on an `AvailabilityZone` column that zoneless
+catalogs do not have, while Shadeform's provisioner stamps `zone=region` on the success
+path. `core.py` turns the resulting error into `0.0`, so a cluster nobody could price is
+indistinguishable from one that was free — every successful Shadeform run reported zero
+spend.
+
+**A delisted instance type takes down the whole control plane.**
+`shadeform_catalog._call_or_default` exists to answer "not in the catalog" with a default,
+but its predicate tests for the substring `not found` while the message reads
+`No instance type X found.` — "No … found" never contains "not found", so all five defaults
+are unreachable for the case they were written for. A cluster still running on an instance
+type that has left the catalog therefore makes `repr(handle.launched_resources)` raise,
+which kills `core.status()` outright: `sky status`, `ontic cluster list` and the launch
+matcher all die together, and **no new job can be submitted anywhere** until somebody
+removes the record by hand. Seen 2026-08-13, when `latitude_H100` left the snapshot while a
+cluster was up on it — the routine `H100:1` match at the time, not an exotic one.
+
+That last one is the sharp edge of the section below: the churn is expected, and it must be
+survivable rather than fatal.
 
 ## What it does not fix
 
